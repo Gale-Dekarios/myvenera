@@ -42,6 +42,21 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
 
   Map<LocalComic, bool> selectedComics = {};
 
+  void _updateValidationProgress(
+    LoadingDialogController controller,
+    LocalValidationProgress progress,
+  ) {
+    controller.setMessage(progress.message);
+    controller.setProgress(progress.progress);
+  }
+
+  String _validationDuplicateSummary(LocalValidationReport report) {
+    if (report.duplicateGroupsMerged <= 0) {
+      return '';
+    }
+    return '\n${'Merged @g duplicate folders and @f files.'.tlParams({'g': report.duplicateGroupsMerged, 'f': report.duplicateFilesMerged})}';
+  }
+
   void update() {
     if (keyword.isEmpty) {
       setState(() {
@@ -695,6 +710,8 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
       App.rootContext,
       barrierDismissible: false,
       allowCancel: false,
+      withProgress: true,
+      message: "Validate Local Comics".tl,
     );
     try {
       final checkTitle = appdata.settings['validateLocalByUrlTitle'] == true;
@@ -703,6 +720,9 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
         checkTitleFromUrl: checkTitle,
         checkBrokenImages: false,
         targetComics: targetComics,
+        onProgress: (progress) {
+          _updateValidationProgress(loadingDialog, progress);
+        },
       );
       loadingDialog.close();
 
@@ -712,10 +732,12 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
           return;
         }
         context.showMessage(
-          message: 'Checked: @checked/@total, all valid.'.tlParams({
-            'checked': preview.checked,
-            'total': preview.total,
-          }),
+          message:
+              'Checked: @checked/@total, all valid.'.tlParams({
+                'checked': preview.checked,
+                'total': preview.total,
+              }) +
+              _validationDuplicateSummary(preview),
         );
         return;
       }
@@ -764,6 +786,8 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
         App.rootContext,
         barrierDismissible: false,
         allowCancel: false,
+        withProgress: true,
+        message: "Validate Local Comics".tl,
       );
       final report = await LocalManager().validateAndRepairLocalComics(
         repair: true,
@@ -771,6 +795,9 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
         checkBrokenImages: false,
         targetComics: targetComics,
         issues: preview.issues,
+        onProgress: (progress) {
+          _updateValidationProgress(loadingDialog, progress);
+        },
       );
       context.showMessage(
         message:
@@ -780,7 +807,8 @@ class _LocalComicsPageState extends State<LocalComicsPage> {
                   'repaired': report.repaired,
                   'failed': report.failed,
                   'skipped': report.skipped,
-                }),
+                }) +
+            _validationDuplicateSummary(preview),
       );
       if (report.messages.isNotEmpty) {
         Log.error('Local Validation', report.messages.take(50).join('\n'));
