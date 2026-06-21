@@ -325,6 +325,26 @@ class LocalManager with ChangeNotifier {
       }
     }
 
+    for (final dir in _listLocalComicDirectories()) {
+      final file = _comicInfoFileForBaseDir(dir.path);
+      final item = await _readComicInfoFile(file);
+      if (item == null) {
+        continue;
+      }
+      final sourceKey = item['sourceKey']?.toString();
+      final comicId = item['comicId']?.toString();
+      if (sourceKey == null || sourceKey.isEmpty || comicId == null) {
+        continue;
+      }
+      final key = _comicInfoKey(ComicType.fromKey(sourceKey), comicId);
+      final old = _comicInfoItems[key];
+      _comicInfoItems[key] = {
+        ...?old,
+        ...item,
+        'directory': item['directory'] ?? dir.name,
+      };
+    }
+
     if (shouldMigrateLegacy && _legacyComicInfoFile.existsSync()) {
       _removeLegacyComicInfoFile = true;
       _scheduleComicInfoFlush();
@@ -491,6 +511,155 @@ class LocalManager with ChangeNotifier {
     return (await _chapterDirectoriesAsync(comic)).length;
   }
 
+  Future<List<Directory>> _chapterDirectoriesByBaseDir(String baseDir) async {
+    final base = Directory(baseDir);
+    if (!base.existsSync()) {
+      return const [];
+    }
+    final dirs = <Directory>[];
+    try {
+      await for (final entity in base.list(followLinks: false)) {
+        if (entity is Directory && !entity.name.startsWith('.')) {
+          dirs.add(entity);
+        }
+      }
+    } catch (_) {
+      return const [];
+    }
+    dirs.sort((a, b) => a.name.compareTo(b.name));
+    return dirs;
+  }
+
+  Future<int> _countPagesByBaseDir(
+    String baseDir, {
+    required bool hasChapters,
+  }) async {
+    if (!hasChapters) {
+      return _countImageFilesInDirectoryAsync(Directory(baseDir));
+    }
+    int count = 0;
+    for (final dir in await _chapterDirectoriesByBaseDir(baseDir)) {
+      count += await _countImageFilesInDirectoryAsync(dir);
+    }
+    return count;
+  }
+
+  ({int latestModifiedMs, int totalBytes}) _scanDirectoryScore(Directory dir) {
+    int latest = 0;
+    int bytes = 0;
+    try {
+      final stat = dir.statSync();
+      latest = stat.modified.millisecondsSinceEpoch;
+    } catch (_) {}
+    try {
+      for (final entity in dir.listSync(recursive: true, followLinks: false)) {
+        if (entity is File) {
+          try {
+            final stat = entity.statSync();
+            final m = stat.modified.millisecondsSinceEpoch;
+            if (m > latest) latest = m;
+            bytes += stat.size;
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    return (latestModifiedMs: latest, totalBytes: bytes);
+  }
+
+  Future<Directory?> _findDirectoryByStoredComicInfo(
+    String id,
+    ComicType type,
+  ) async {
+    Directory? bestDir;
+    int bestLatest = -1;
+    int bestSize = -1;
+    for (final dir in _listLocalComicDirectories()) {
+      final info = await _readComicInfoFile(_comicInfoFileForBaseDir(dir.path));
+      if (info == null) {
+        continue;
+      }
+      if (info['sourceKey']?.toString() != type.sourceKey ||
+          info['comicId']?.toString() != id) {
+        continue;
+      }
+      final key = _comicInfoKey(type, id);
+      _comicInfoItems[key] = {
+        ...?_comicInfoItems[key],
+        ...info,
+        'directory': info['directory'] ?? dir.name,
+      };
+      final score = _scanDirectoryScore(dir);
+      if (score.latestModifiedMs > bestLatest ||
+          (score.latestModifiedMs == bestLatest &&
+              score.totalBytes > bestSize)) {
+        bestDir = dir;
+        bestLatest = score.latestModifiedMs;
+        bestSize = score.totalBytes;
+      }
+    }
+    return bestDir;
+  }
+
+  Future<bool> prepareDirectoryForDownload(
+    String directoryPath,
+    ComicDetails comic,
+    List<String> chapterIds,
+    int pageCount,
+  ) async {
+    final dir = Directory(directoryPath);
+    if (!dir.existsSync()) {
+      await dir.create(recursive: true);
+    }
+
+    final info = await _readComicInfoFile(_comicInfoFileForBaseDir(dir.path));
+    final expectedChapterCount = comic.chapters == null ? 0 : chapterIds.length;
+    final actualChapterCount = comic.chapters == null
+        ? 0
+        : (await _chapterDirectoriesByBaseDir(dir.path)).length;
+    final actualPageCount = await _countPagesByBaseDir(
+      dir.path,
+      hasChapters: comic.chapters != null,
+    );
+
+    bool shouldReset = false;
+    if (info != null) {
+      if (info['sourceKey']?.toString() != comic.sourceKey ||
+          info['comicId']?.toString() != comic.id ||
+          !_titlesMatch(
+            info['title']?.toString() ?? comic.title,
+            comic.title,
+          )) {
+        shouldReset = true;
+      }
+    }
+
+    if (!shouldReset) {
+      if (expectedChapterCount > 0 &&
+          actualChapterCount > expectedChapterCount) {
+        shouldReset = true;
+      }
+      if (pageCount > 0 && actualPageCount > pageCount) {
+        shouldReset = true;
+      }
+    }
+
+    if (shouldReset) {
+      try {
+        for (final entity in dir.listSync(followLinks: false)) {
+          await entity.deleteIgnoreError(recursive: true);
+        }
+      } catch (_) {}
+    }
+
+    cacheDownloadingComicInfo(
+      comic,
+      dir.path,
+      chapterCount: expectedChapterCount,
+      pageCount: pageCount,
+    );
+    return shouldReset;
+  }
+
   void _upsertComicInfo(LocalComic comic, {String? url}) {
     final key = _comicInfoKey(comic.comicType, comic.id);
     final old = _comicInfoItems[key] ?? <String, dynamic>{};
@@ -509,6 +678,37 @@ class LocalManager with ChangeNotifier {
       'updatedAt': DateTime.now().toIso8601String(),
     };
     _invalidDownloadedComicKeys.remove(key);
+    _scheduleComicInfoFlush([key]);
+  }
+
+  List<String> _flattenComicTags(ComicDetails comic) {
+    return comic.tags.entries.expand((e) {
+      return e.value.map((v) => '${e.key}:$v');
+    }).toList();
+  }
+
+  void cacheDownloadingComicInfo(
+    ComicDetails comic,
+    String directoryPath, {
+    required int chapterCount,
+    required int pageCount,
+  }) {
+    final dir = Directory(directoryPath);
+    final key = _comicInfoKey(comic.comicType, comic.id);
+    final old = _comicInfoItems[key] ?? <String, dynamic>{};
+    _comicInfoItems[key] = {
+      ...old,
+      'sourceKey': comic.sourceKey,
+      'comicId': comic.id,
+      'title': comic.title,
+      'subtitle': comic.subTitle ?? '',
+      'directory': dir.name,
+      'chapterCount': chapterCount,
+      'pageCount': pageCount,
+      'tags': _flattenComicTags(comic),
+      'url': comic.url ?? old['url'],
+      'updatedAt': DateTime.now().toIso8601String(),
+    };
     _scheduleComicInfoFlush([key]);
   }
 
@@ -1174,6 +1374,10 @@ class LocalManager with ChangeNotifier {
     if (comic != null) {
       return Directory(FilePath.join(path, comic.directory));
     }
+    final draftDir = await _findDirectoryByStoredComicInfo(id, type);
+    if (draftDir != null) {
+      return draftDir;
+    }
     const comicDirectoryMaxLength = 80;
     if (name.length > comicDirectoryMaxLength) {
       name = name.substring(0, comicDirectoryMaxLength);
@@ -1187,31 +1391,6 @@ class LocalManager with ChangeNotifier {
       return exists.isEmpty ||
           (exists.first['id'] == id &&
               exists.first['comic_type'] == type.value);
-    }
-
-    ({int latestModifiedMs, int totalBytes}) scanDirectoryScore(Directory dir) {
-      int latest = 0;
-      int bytes = 0;
-      try {
-        final stat = dir.statSync();
-        latest = stat.modified.millisecondsSinceEpoch;
-      } catch (_) {}
-      try {
-        for (final entity in dir.listSync(
-          recursive: true,
-          followLinks: false,
-        )) {
-          if (entity is File) {
-            try {
-              final stat = entity.statSync();
-              final m = stat.modified.millisecondsSinceEpoch;
-              if (m > latest) latest = m;
-              bytes += stat.size;
-            } catch (_) {}
-          }
-        }
-      } catch (_) {}
-      return (latestModifiedMs: latest, totalBytes: bytes);
     }
 
     bool isVariantName(String base, String candidate) {
@@ -1242,7 +1421,7 @@ class LocalManager with ChangeNotifier {
           if (!isVariantName(preferredName, dirName)) continue;
           if (!canReuseDirectoryName(dirName)) continue;
 
-          final score = scanDirectoryScore(entity);
+          final score = _scanDirectoryScore(entity);
           final latest = score.latestModifiedMs;
           final size = score.totalBytes;
           if (latest > bestLatest ||
@@ -1929,6 +2108,7 @@ class LocalManager with ChangeNotifier {
     bool repair = true,
     bool checkTitleFromUrl = true,
     bool checkBrokenImages = false,
+    List<LocalComic>? targetComics,
     List<LocalValidationIssue>? issues,
   }) async {
     final report = LocalValidationReport();
@@ -1942,21 +2122,23 @@ class LocalManager with ChangeNotifier {
     final issueList = issues ?? <LocalValidationIssue>[];
 
     if (issues == null) {
-      final comics = getComics(LocalSortType.timeDesc);
+      final comics = targetComics ?? getComics(LocalSortType.timeDesc);
       report.total = comics.length;
       report.dbComics = comics.length;
 
-      final diskDirs = _listLocalComicDirectories();
-      report.diskDirectories = diskDirs.length;
-      final dbDirSet = <String>{};
-      for (final comic in comics) {
-        dbDirSet.add(_normalizePathForCompare(comic.baseDir));
-      }
-      for (final dir in diskDirs) {
-        if (!dbDirSet.contains(_normalizePathForCompare(dir.path))) {
-          report.unindexedDirectories++;
-          if (report.unindexedDirectorySamples.length < 20) {
-            report.unindexedDirectorySamples.add(dir.name);
+      if (targetComics == null) {
+        final diskDirs = _listLocalComicDirectories();
+        report.diskDirectories = diskDirs.length;
+        final dbDirSet = <String>{};
+        for (final comic in comics) {
+          dbDirSet.add(_normalizePathForCompare(comic.baseDir));
+        }
+        for (final dir in diskDirs) {
+          if (!dbDirSet.contains(_normalizePathForCompare(dir.path))) {
+            report.unindexedDirectories++;
+            if (report.unindexedDirectorySamples.length < 20) {
+              report.unindexedDirectorySamples.add(dir.name);
+            }
           }
         }
       }
@@ -2013,6 +2195,12 @@ class LocalManager with ChangeNotifier {
       final info = issue.info;
 
       if (issue.reason.contains('missing comic info entry')) {
+        _upsertComicInfo(comic);
+        report.repaired++;
+        continue;
+      }
+
+      if (comic.comicType == ComicType.local) {
         _upsertComicInfo(comic);
         report.repaired++;
         continue;

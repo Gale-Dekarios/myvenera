@@ -104,22 +104,22 @@ abstract mixin class _ComicPageActions {
   void read([int? ep, int? page, int? group]) {
     App.rootContext
         .to(
-      () => Reader(
-        type: comic.comicType,
-        cid: comic.id,
-        name: comic.title,
-        chapters: comic.chapters,
-        initialChapter: ep,
-        initialPage: page,
-        initialChapterGroup: group,
-        history: history ?? History.fromModel(model: comic, ep: 0, page: 0),
-        author: comic.findAuthor() ?? '',
-        tags: comic.plainTags,
-      )
-    )
+          () => Reader(
+            type: comic.comicType,
+            cid: comic.id,
+            name: comic.title,
+            chapters: comic.chapters,
+            initialChapter: ep,
+            initialPage: page,
+            initialChapterGroup: group,
+            history: history ?? History.fromModel(model: comic, ep: 0, page: 0),
+            author: comic.findAuthor() ?? '',
+            tags: comic.plainTags,
+          ),
+        )
         .then((_) {
-      onReadEnd();
-    });
+          onReadEnd();
+        });
   }
 
   void continueRead() {
@@ -131,6 +131,93 @@ abstract mixin class _ComicPageActions {
 
   void onReadEnd();
 
+  bool _isRestrictedCategoryComic() {
+    bool containsRestricted(String text) {
+      final t = text.toLowerCase().replaceAll(' ', '');
+      return t.contains('绂佹浉鐩寗') ||
+          t.contains('绂佷功鐩綍') ||
+          t.contains('webtoon');
+    }
+
+    for (final entry in comic.tags.entries) {
+      if (containsRestricted(entry.key)) {
+        return true;
+      }
+      for (final tag in entry.value) {
+        if (containsRestricted(tag)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  Future<({bool skipRestricted, bool skipRaw})?>
+  _showDownloadFilterDialog() async {
+    bool skipRestricted = true;
+    bool skipRaw = appdata.implicitData['downloadSkipRawChapters'] != false;
+    bool? confirmed;
+    await showDialog(
+      context: App.rootContext,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return ContentDialog(
+              title: 'Download Options'.tl,
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CheckboxListTile(
+                    title: Text('Skip restricted categories'.tl),
+                    subtitle: Text('绂佹浉鐩寗 / WEBTOON'),
+                    value: skipRestricted,
+                    onChanged: (v) {
+                      setState(() {
+                        skipRestricted = v ?? skipRestricted;
+                      });
+                    },
+                  ),
+                  CheckboxListTile(
+                    title: Text('Skip raw chapters'.tl),
+                    subtitle: Text('RAW / 生肉'),
+                    value: skipRaw,
+                    onChanged: (v) {
+                      setState(() {
+                        skipRaw = v ?? skipRaw;
+                      });
+                    },
+                  ),
+                ],
+              ),
+              actions: [
+                Button.text(
+                  onPressed: () {
+                    confirmed = null;
+                    context.pop();
+                  },
+                  child: Text('Cancel'.tl),
+                ),
+                Button.filled(
+                  onPressed: () {
+                    confirmed = true;
+                    appdata.implicitData['downloadSkipRawChapters'] = skipRaw;
+                    appdata.writeImplicitData();
+                    context.pop();
+                  },
+                  child: Text('Confirm'.tl),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    if (confirmed != true) {
+      return null;
+    }
+    return (skipRestricted: skipRestricted, skipRaw: skipRaw);
+  }
+
   void download() async {
     if (LocalManager().isDownloading(comic.id, comic.comicType)) {
       App.rootContext.showMessage(message: "The comic is downloading".tl);
@@ -139,6 +226,17 @@ abstract mixin class _ComicPageActions {
     if (comic.chapters == null &&
         LocalManager().isDownloaded(comic.id, comic.comicType, 0)) {
       App.rootContext.showMessage(message: "The comic is downloaded".tl);
+      return;
+    }
+
+    final options = await _showDownloadFilterDialog();
+    if (options == null) {
+      return;
+    }
+    if (options.skipRestricted && _isRestrictedCategoryComic()) {
+      App.rootContext.showMessage(
+        message: 'Skipped restricted category comic'.tl,
+      );
       return;
     }
 
@@ -165,10 +263,7 @@ abstract mixin class _ComicPageActions {
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      RadioListTile<int>(
-                        value: -1,
-                        title: Text("Normal".tl),
-                      ),
+                      RadioListTile<int>(value: -1, title: Text("Normal".tl)),
                       ExpansionTile(
                         title: Text("Archive".tl),
                         shape: const RoundedRectangleBorder(
@@ -183,16 +278,17 @@ abstract mixin class _ComicPageActions {
                             comicSource.archiveDownloader!
                                 .getArchives(comic.id)
                                 .then((value) {
-                              if (value.success) {
-                                archives = value.data;
-                              } else {
-                                App.rootContext
-                                    .showMessage(message: value.errorMessage!);
-                              }
-                              setState(() {
-                                isLoading = false;
-                              });
-                            });
+                                  if (value.success) {
+                                    archives = value.data;
+                                  } else {
+                                    App.rootContext.showMessage(
+                                      message: value.errorMessage!,
+                                    );
+                                  }
+                                  setState(() {
+                                    isLoading = false;
+                                  });
+                                });
                           }
                         },
                         children: [
@@ -204,9 +300,9 @@ abstract mixin class _ComicPageActions {
                                 value: i,
                                 title: Text(archives![i].title),
                                 subtitle: Text(archives![i].description),
-                              )
+                              ),
                         ],
-                      )
+                      ),
                     ],
                   ),
                 ),
@@ -222,11 +318,8 @@ abstract mixin class _ComicPageActions {
                       setState(() {
                         isGettingLink = true;
                       });
-                      var res =
-                          await comicSource.archiveDownloader!.getDownloadUrl(
-                        comic.id,
-                        archives![selected].id,
-                      );
+                      var res = await comicSource.archiveDownloader!
+                          .getDownloadUrl(comic.id, archives![selected].id);
                       if (res.error) {
                         App.rootContext.showMessage(message: res.errorMessage!);
                         setState(() {
@@ -234,10 +327,12 @@ abstract mixin class _ComicPageActions {
                         });
                       } else if (context.mounted) {
                         if (res.data.isNotEmpty) {
-                          LocalManager()
-                            .addTask(ArchiveDownloadTask(res.data, comic));
-                          App.rootContext
-                            .showMessage(message: "Download started".tl);
+                          LocalManager().addTask(
+                            ArchiveDownloadTask(res.data, comic),
+                          );
+                          App.rootContext.showMessage(
+                            message: "Download started".tl,
+                          );
                         }
                         context.pop();
                       }
@@ -256,19 +351,23 @@ abstract mixin class _ComicPageActions {
     }
 
     if (comic.chapters == null) {
-      LocalManager().addTask(ImagesDownloadTask(
-        source: comicSource,
-        comicId: comic.id,
-        comic: comic,
-      ));
+      LocalManager().addTask(
+        ImagesDownloadTask(
+          source: comicSource,
+          comicId: comic.id,
+          comic: comic,
+          skipRawChapters: options.skipRaw,
+        ),
+      );
     } else {
       List<int>? selected;
       var downloaded = <int>[];
       var localComic = LocalManager().find(comic.id, comic.comicType);
       if (localComic != null) {
         for (int i = 0; i < comic.chapters!.length; i++) {
-          if (localComic.downloadedChapters
-              .contains(comic.chapters!.ids.elementAt(i))) {
+          if (localComic.downloadedChapters.contains(
+            comic.chapters!.ids.elementAt(i),
+          )) {
             downloaded.add(i);
           }
         }
@@ -282,14 +381,17 @@ abstract mixin class _ComicPageActions {
         ),
       );
       if (selected == null) return;
-      LocalManager().addTask(ImagesDownloadTask(
-        source: comicSource,
-        comicId: comic.id,
-        comic: comic,
-        chapters: selected!.map((i) {
-          return comic.chapters!.ids.elementAt(i);
-        }).toList(),
-      ));
+      LocalManager().addTask(
+        ImagesDownloadTask(
+          source: comicSource,
+          comicId: comic.id,
+          comic: comic,
+          chapters: selected!.map((i) {
+            return comic.chapters!.ids.elementAt(i);
+          }).toList(),
+          skipRawChapters: options.skipRaw,
+        ),
+      );
     }
     App.rootContext.showMessage(message: "Download started".tl);
     update();
@@ -303,56 +405,47 @@ abstract mixin class _ComicPageActions {
 
   void showMoreActions() {
     var context = App.rootContext;
-    showMenuX(
-        context,
-        Offset(
-          context.width - 16,
-          context.padding.top,
+    showMenuX(context, Offset(context.width - 16, context.padding.top), [
+      MenuEntry(
+        icon: Icons.copy,
+        text: "Copy Title".tl,
+        onClick: () {
+          Clipboard.setData(ClipboardData(text: comic.title));
+          context.showMessage(message: "Copied".tl);
+        },
+      ),
+      MenuEntry(
+        icon: Icons.copy_rounded,
+        text: "Copy ID".tl,
+        onClick: () {
+          Clipboard.setData(ClipboardData(text: comic.id));
+          context.showMessage(message: "Copied".tl);
+        },
+      ),
+      if (comic.url != null)
+        MenuEntry(
+          icon: Icons.link,
+          text: "Copy URL".tl,
+          onClick: () {
+            Clipboard.setData(ClipboardData(text: comic.url!));
+            context.showMessage(message: "Copied".tl);
+          },
         ),
-        [
-          MenuEntry(
-            icon: Icons.copy,
-            text: "Copy Title".tl,
-            onClick: () {
-              Clipboard.setData(ClipboardData(text: comic.title));
-              context.showMessage(message: "Copied".tl);
-            },
-          ),
-          MenuEntry(
-            icon: Icons.copy_rounded,
-            text: "Copy ID".tl,
-            onClick: () {
-              Clipboard.setData(ClipboardData(text: comic.id));
-              context.showMessage(message: "Copied".tl);
-            },
-          ),
-          if (comic.url != null)
-            MenuEntry(
-              icon: Icons.link,
-              text: "Copy URL".tl,
-              onClick: () {
-                Clipboard.setData(ClipboardData(text: comic.url!));
-                context.showMessage(message: "Copied".tl);
-              },
-            ),
-          if (comic.url != null)
-            MenuEntry(
-              icon: Icons.open_in_browser,
-              text: "Open in Browser".tl,
-              onClick: () {
-                launchUrlString(comic.url!);
-              },
-            ),
-        ]);
+      if (comic.url != null)
+        MenuEntry(
+          icon: Icons.open_in_browser,
+          text: "Open in Browser".tl,
+          onClick: () {
+            launchUrlString(comic.url!);
+          },
+        ),
+    ]);
   }
 
   void showComments() {
     showSideBar(
       App.rootContext,
-      CommentsPage(
-        data: comic,
-        source: comicSource,
-      ),
+      CommentsPage(data: comic, source: comicSource),
     );
   }
 
@@ -376,9 +469,7 @@ abstract mixin class _ComicPageActions {
                   width: 210,
                   child: Column(
                     children: [
-                      const SizedBox(
-                        height: 10,
-                      ),
+                      const SizedBox(height: 10),
                       RatingWidget(
                         padding: 2,
                         onRatingUpdate: (value) => rating = value,
@@ -395,26 +486,28 @@ abstract mixin class _ComicPageActions {
                           });
                           comicSource.starRatingFunc!(comic.id, rating.round())
                               .then((value) {
-                            if (value.success) {
-                              App.rootContext
-                                  .showMessage(message: "Success".tl);
-                              Navigator.of(dialogContext).pop();
-                            } else {
-                              App.rootContext
-                                  .showMessage(message: value.errorMessage!);
-                              setState(() {
-                                isLoading = false;
+                                if (value.success) {
+                                  App.rootContext.showMessage(
+                                    message: "Success".tl,
+                                  );
+                                  Navigator.of(dialogContext).pop();
+                                } else {
+                                  App.rootContext.showMessage(
+                                    message: value.errorMessage!,
+                                  );
+                                  setState(() {
+                                    isLoading = false;
+                                  });
+                                }
                               });
-                            }
-                          });
                         },
                         child: Text("Submit".tl),
-                      )
+                      ),
                     ],
                   ),
                 ),
               ),
-            )
+            ),
           ],
         ),
       ),
