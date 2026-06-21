@@ -18,6 +18,7 @@ import 'package:venera/network/images.dart';
 import 'package:venera/pages/reader/reader.dart';
 import 'package:venera/utils/io.dart';
 import 'package:venera/utils/file_type.dart';
+import 'package:venera/utils/translations.dart';
 
 import 'app.dart';
 import 'history.dart';
@@ -673,6 +674,28 @@ class LocalManager with ChangeNotifier {
       'directory': comic.directory,
       'chapterCount': comic.downloadedChapters.length,
       'pageCount': _countComicPagesSync(comic),
+      'tags': comic.tags,
+      'url': url ?? old['url'],
+      'updatedAt': DateTime.now().toIso8601String(),
+    };
+    _invalidDownloadedComicKeys.remove(key);
+    _scheduleComicInfoFlush([key]);
+  }
+
+  Future<void> _upsertComicInfoAsync(LocalComic comic, {String? url}) async {
+    final key = _comicInfoKey(comic.comicType, comic.id);
+    final old = _comicInfoItems[key] ?? <String, dynamic>{};
+    final sourceKey = comic.comicType.sourceKey;
+    final pageCount = await _countComicPagesAsync(comic);
+    _comicInfoItems[key] = {
+      ...old,
+      'sourceKey': sourceKey,
+      'comicId': comic.id,
+      'title': comic.title,
+      'subtitle': comic.subtitle,
+      'directory': comic.directory,
+      'chapterCount': comic.downloadedChapters.length,
+      'pageCount': pageCount,
       'tags': comic.tags,
       'url': url ?? old['url'],
       'updatedAt': DateTime.now().toIso8601String(),
@@ -2038,6 +2061,529 @@ class LocalManager with ChangeNotifier {
     return true;
   }
 
+  void _emitValidationProgress(
+    LocalValidationProgressCallback? onProgress, {
+    required String stage,
+    required String message,
+    required int current,
+    required int total,
+    double? progress,
+  }) {
+    if (onProgress == null) {
+      return;
+    }
+    onProgress(
+      LocalValidationProgress(
+        stage: stage,
+        message: message,
+        current: current,
+        total: total,
+        progress: progress ?? (total <= 0 ? null : current / total),
+      ),
+    );
+  }
+
+  String _directoryBaseName(String name) {
+    return name.replaceFirst(RegExp(r'\s*\(\d+\)$'), '').trimRight();
+  }
+
+  bool _isVariantDirectoryName(String name) {
+    return RegExp(r'\s*\(\d+\)$').hasMatch(name);
+  }
+
+  Future<int> _countImageFilesRecursive(Directory dir) async {
+    if (!dir.existsSync()) {
+      return 0;
+    }
+    int count = 0;
+    try {
+      await for (final entity in dir.list(
+        recursive: true,
+        followLinks: false,
+      )) {
+        if (entity is File && _isComicPageFile(entity)) {
+          count++;
+        }
+      }
+    } catch (_) {
+      return count;
+    }
+    return count;
+  }
+
+  List<String> _inferDownloadedChaptersFromDirectory(LocalComic comic) {
+    if (!comic.hasChapters) {
+      return comic.downloadedChapters;
+    }
+    final base = Directory(comic.baseDir);
+    if (!base.existsSync()) {
+      return comic.downloadedChapters;
+    }
+    final chapterDirNames = <String>{};
+    try {
+      for (final entity in base.listSync(followLinks: false)) {
+        if (entity is Directory && !entity.name.startsWith('.')) {
+          chapterDirNames.add(entity.name);
+        }
+      }
+    } catch (_) {
+      return comic.downloadedChapters;
+    }
+    final chapterIds = <String>[];
+    comic.chapters!.allChapters.forEach((id, title) {
+      final titleDir = getChapterDirectoryName(title);
+      final idDir = getChapterDirectoryName(id);
+      if (chapterDirNames.contains(titleDir) ||
+          chapterDirNames.contains(idDir)) {
+        chapterIds.add(id);
+      }
+    });
+    return chapterIds.isEmpty ? comic.downloadedChapters : chapterIds;
+  }
+
+  String _fileStem(String name) {
+    final dot = name.lastIndexOf('.');
+    if (dot <= 0) {
+      return name;
+    }
+    return name.substring(0, dot);
+  }
+
+  String _fileExt(String name) {
+    final dot = name.lastIndexOf('.');
+    if (dot <= 0) {
+      return '';
+    }
+    return name.substring(dot);
+  }
+
+  Future<String> _nextMergeFilePath(Directory dir, File source) async {
+    final stem = _fileStem(source.name);
+    final ext = _fileExt(source.name);
+    final numericStem = int.tryParse(stem);
+    if (numericStem != null) {
+      int nextIndex = 0;
+      try {
+        await for (final entity in dir.list(followLinks: false)) {
+          if (entity is! File || !_isComicPageFile(entity)) {
+            continue;
+          }
+          final index = int.tryParse(_fileStem(entity.name));
+          if (index != null && index >= nextIndex) {
+            nextIndex = index + 1;
+          }
+        }
+      } catch (_) {}
+      while (File(FilePath.join(dir.path, '$nextIndex$ext')).existsSync()) {
+        nextIndex++;
+      }
+      return FilePath.join(dir.path, '$nextIndex$ext');
+    }
+
+    int i = 1;
+    while (true) {
+      final path = FilePath.join(dir.path, '${stem}_merged_$i$ext');
+      if (!File(path).existsSync()) {
+        return path;
+      }
+      i++;
+    }
+  }
+
+  Future<bool> _moveFileWithMerge(File source, Directory targetDir) async {
+    if (!targetDir.existsSync()) {
+      targetDir.createSync(recursive: true);
+    }
+
+    if (source.name == _comicInfoFileName) {
+      return false;
+    }
+
+    if (source.name.toLowerCase().startsWith('cover.')) {
+      File? existingCover;
+      for (final entity in targetDir.listSync(followLinks: false)) {
+        if (entity is File && entity.name.toLowerCase().startsWith('cover.')) {
+          existingCover = entity;
+          break;
+        }
+      }
+      if (existingCover != null) {
+        await source.deleteIgnoreError();
+        return false;
+      }
+    }
+
+    var targetPath = FilePath.join(targetDir.path, source.name);
+    final targetFile = File(targetPath);
+    if (targetFile.existsSync()) {
+      try {
+        final sourceStat = await source.stat();
+        final targetStat = await targetFile.stat();
+        if (sourceStat.size == targetStat.size) {
+          await source.deleteIgnoreError();
+          return false;
+        }
+      } catch (_) {}
+
+      if (_isComicPageFile(source)) {
+        targetPath = await _nextMergeFilePath(targetDir, source);
+      } else {
+        await source.deleteIgnoreError();
+        return false;
+      }
+    }
+
+    try {
+      await source.rename(targetPath);
+    } catch (_) {
+      await source.copy(targetPath);
+      await source.deleteIgnoreError();
+    }
+    return true;
+  }
+
+  Future<int> _mergeDirectoryContents(
+    Directory source,
+    Directory target,
+  ) async {
+    if (!target.existsSync()) {
+      target.createSync(recursive: true);
+    }
+    int mergedFiles = 0;
+    List<FileSystemEntity> entries;
+    try {
+      entries = source.listSync(followLinks: false);
+    } catch (_) {
+      return 0;
+    }
+
+    for (final entity in entries) {
+      if (entity is File) {
+        if (await _moveFileWithMerge(entity, target)) {
+          mergedFiles++;
+        }
+        continue;
+      }
+      if (entity is! Directory) {
+        continue;
+      }
+      final targetSubDir = Directory(FilePath.join(target.path, entity.name));
+      if (!targetSubDir.existsSync()) {
+        try {
+          await entity.rename(targetSubDir.path);
+        } catch (_) {
+          await targetSubDir.create(recursive: true);
+          mergedFiles += await _mergeDirectoryContents(entity, targetSubDir);
+          await entity.deleteIgnoreError(recursive: true);
+        }
+        continue;
+      }
+      mergedFiles += await _mergeDirectoryContents(entity, targetSubDir);
+      await entity.deleteIgnoreError(recursive: true);
+    }
+
+    return mergedFiles;
+  }
+
+  Future<void> _updateComicDirectoryReference(
+    _LocalDuplicateDirectoryGroup group,
+    Directory canonicalDir,
+  ) async {
+    if (group.comicId == null || group.comicType == null) {
+      return;
+    }
+    final comic = find(group.comicId!, group.comicType!);
+    if (comic == null) {
+      return;
+    }
+
+    final updatedDirectory = canonicalDir.name;
+    final updatedDownloadedChapters = _inferDownloadedChaptersFromDirectory(
+      LocalComic(
+        id: comic.id,
+        title: comic.title,
+        subtitle: comic.subtitle,
+        tags: comic.tags,
+        directory: updatedDirectory,
+        chapters: comic.chapters,
+        cover: comic.cover,
+        comicType: comic.comicType,
+        downloadedChapters: comic.downloadedChapters,
+        createdAt: comic.createdAt,
+      ),
+    );
+
+    _db.execute(
+      'UPDATE comics SET directory = ?, downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
+      [
+        updatedDirectory,
+        jsonEncode(updatedDownloadedChapters),
+        comic.id,
+        comic.comicType.value,
+      ],
+    );
+
+    final updatedComic = LocalComic(
+      id: comic.id,
+      title: comic.title,
+      subtitle: comic.subtitle,
+      tags: comic.tags,
+      directory: updatedDirectory,
+      chapters: comic.chapters,
+      cover: comic.cover,
+      comicType: comic.comicType,
+      downloadedChapters: updatedDownloadedChapters,
+      createdAt: comic.createdAt,
+    );
+    _upsertComicInfo(
+      updatedComic,
+      url: _comicInfoItems[group.key]?['url']?.toString(),
+    );
+  }
+
+  Future<List<_LocalDuplicateDirectoryGroup>> _findDuplicateDirectoryGroups({
+    List<LocalComic>? targetComics,
+  }) async {
+    final dirs = _listLocalComicDirectories();
+    final currentComics = targetComics ?? getComics(LocalSortType.timeDesc);
+    final infoKeyByPath = <String, String?>{};
+    final comicTypeByPath = <String, ComicType?>{};
+    final comicIdByPath = <String, String?>{};
+    final baseGroups = <String, List<Directory>>{};
+
+    for (final dir in dirs) {
+      baseGroups.putIfAbsent(_directoryBaseName(dir.name), () => []).add(dir);
+      final info = await _readComicInfoFile(_comicInfoFileForBaseDir(dir.path));
+      final sourceKey = info?['sourceKey']?.toString();
+      final comicId = info?['comicId']?.toString();
+      if (sourceKey != null && comicId != null) {
+        final comicType = ComicType.fromKey(sourceKey);
+        infoKeyByPath[dir.path] = _comicInfoKey(comicType, comicId);
+        comicTypeByPath[dir.path] = comicType;
+        comicIdByPath[dir.path] = comicId;
+      }
+    }
+
+    final groups = <_LocalDuplicateDirectoryGroup>[];
+    final added = <String>{};
+
+    for (final entry in baseGroups.entries) {
+      if (entry.value.length <= 1) {
+        continue;
+      }
+      final dirsInGroup = entry.value.toList()
+        ..sort((a, b) => a.name.compareTo(b.name));
+      final infoKeys = dirsInGroup
+          .map((dir) => infoKeyByPath[dir.path])
+          .whereType<String>()
+          .toSet();
+      if (infoKeys.isEmpty) {
+        final matchedComics = currentComics.where((comic) {
+          if (_directoryBaseName(comic.directory) == entry.key) {
+            return true;
+          }
+          return dirsInGroup.any(
+            (dir) =>
+                _normalizePathForCompare(comic.baseDir) ==
+                _normalizePathForCompare(dir.path),
+          );
+        }).toList();
+        final matchedKeys = matchedComics
+            .map((comic) => _comicInfoKey(comic.comicType, comic.id))
+            .toSet();
+        if (matchedKeys.length == 1 && matchedComics.isNotEmpty) {
+          final comic = matchedComics.first;
+          groups.add(
+            _LocalDuplicateDirectoryGroup(
+              label: entry.key,
+              key: _comicInfoKey(comic.comicType, comic.id),
+              comicType: comic.comicType,
+              comicId: comic.id,
+              directories: dirsInGroup,
+            ),
+          );
+          for (final dir in dirsInGroup) {
+            added.add(dir.path);
+          }
+        }
+        continue;
+      }
+
+      if (infoKeys.length == 1) {
+        final firstDir = dirsInGroup.firstWhere(
+          (dir) => infoKeyByPath[dir.path] != null,
+        );
+        final key = infoKeyByPath[firstDir.path]!;
+        groups.add(
+          _LocalDuplicateDirectoryGroup(
+            label: entry.key,
+            key: key,
+            comicType: comicTypeByPath[firstDir.path],
+            comicId: comicIdByPath[firstDir.path],
+            directories: dirsInGroup,
+          ),
+        );
+        for (final dir in dirsInGroup) {
+          added.add(dir.path);
+        }
+        continue;
+      }
+
+      for (final infoKey in infoKeys) {
+        final matched = dirsInGroup
+            .where((dir) => infoKeyByPath[dir.path] == infoKey)
+            .toList();
+        if (matched.length <= 1) {
+          continue;
+        }
+        final firstDir = matched.first;
+        groups.add(
+          _LocalDuplicateDirectoryGroup(
+            label: entry.key,
+            key: infoKey,
+            comicType: comicTypeByPath[firstDir.path],
+            comicId: comicIdByPath[firstDir.path],
+            directories: matched,
+          ),
+        );
+        for (final dir in matched) {
+          added.add(dir.path);
+        }
+      }
+    }
+
+    final metaGroups = <String, List<Directory>>{};
+    for (final dir in dirs) {
+      final key = infoKeyByPath[dir.path];
+      if (key == null) {
+        continue;
+      }
+      metaGroups.putIfAbsent(key, () => []).add(dir);
+    }
+    for (final entry in metaGroups.entries) {
+      final unmatched = entry.value
+          .where((dir) => !added.contains(dir.path))
+          .toList();
+      if (unmatched.length <= 1) {
+        continue;
+      }
+      final firstDir = unmatched.first;
+      groups.add(
+        _LocalDuplicateDirectoryGroup(
+          label: _directoryBaseName(firstDir.name),
+          key: entry.key,
+          comicType: comicTypeByPath[firstDir.path],
+          comicId: comicIdByPath[firstDir.path],
+          directories: unmatched,
+        ),
+      );
+    }
+
+    if (targetComics == null) {
+      return groups;
+    }
+
+    final targetKeys = targetComics
+        .map((comic) => _comicInfoKey(comic.comicType, comic.id))
+        .toSet();
+    final targetPaths = targetComics
+        .map((comic) => _normalizePathForCompare(comic.baseDir))
+        .toSet();
+    final targetBaseNames = targetComics
+        .map((comic) => _directoryBaseName(comic.directory))
+        .toSet();
+
+    return groups.where((group) {
+      if (group.key.isNotEmpty && targetKeys.contains(group.key)) {
+        return true;
+      }
+      for (final dir in group.directories) {
+        if (targetPaths.contains(_normalizePathForCompare(dir.path))) {
+          return true;
+        }
+        if (targetBaseNames.contains(_directoryBaseName(dir.name))) {
+          return true;
+        }
+      }
+      return false;
+    }).toList();
+  }
+
+  Future<LocalDuplicateMergeReport> _mergeDuplicateDirectories({
+    List<LocalComic>? targetComics,
+    LocalValidationProgressCallback? onProgress,
+  }) async {
+    final report = LocalDuplicateMergeReport();
+    final groups = await _findDuplicateDirectoryGroups(
+      targetComics: targetComics,
+    );
+    report.groupsFound = groups.length;
+    if (groups.isEmpty) {
+      return report;
+    }
+
+    for (int i = 0; i < groups.length; i++) {
+      final group = groups[i];
+      _emitValidationProgress(
+        onProgress,
+        stage: 'merge-duplicates',
+        message:
+            '${'Merging duplicate folders'.tl} ${i + 1}/${groups.length}: ${group.label}',
+        current: i,
+        total: groups.length,
+      );
+
+      Directory? canonicalDir;
+      int bestCount = -1;
+      bool bestIsVariant = true;
+      for (final dir in group.directories) {
+        final count = await _countImageFilesRecursive(dir);
+        final isVariant = _isVariantDirectoryName(dir.name);
+        if (count > bestCount ||
+            (count == bestCount && bestIsVariant && !isVariant)) {
+          canonicalDir = dir;
+          bestCount = count;
+          bestIsVariant = isVariant;
+        }
+      }
+
+      if (canonicalDir == null) {
+        continue;
+      }
+
+      int mergedFiles = 0;
+      int mergedDirs = 0;
+      for (final dir in group.directories) {
+        if (_normalizePathForCompare(dir.path) ==
+            _normalizePathForCompare(canonicalDir.path)) {
+          continue;
+        }
+        mergedFiles += await _mergeDirectoryContents(dir, canonicalDir);
+        await dir.deleteIgnoreError(recursive: true);
+        mergedDirs++;
+      }
+
+      await _updateComicDirectoryReference(group, canonicalDir);
+      report.groupsMerged++;
+      report.directoriesMerged += mergedDirs;
+      report.filesMerged += mergedFiles;
+      if (report.samples.length < 20) {
+        report.samples.add(group.label);
+      }
+
+      _emitValidationProgress(
+        onProgress,
+        stage: 'merge-duplicates',
+        message:
+            '${'Merging duplicate folders'.tl} ${i + 1}/${groups.length}: ${group.label}',
+        current: i + 1,
+        total: groups.length,
+      );
+    }
+
+    return report;
+  }
+
   void scheduleStartupDownloadValidation({
     Duration delay = const Duration(seconds: 2),
   }) {
@@ -2110,6 +2656,7 @@ class LocalManager with ChangeNotifier {
     bool checkBrokenImages = false,
     List<LocalComic>? targetComics,
     List<LocalValidationIssue>? issues,
+    LocalValidationProgressCallback? onProgress,
   }) async {
     final report = LocalValidationReport();
     if (repair && downloadingTasks.isNotEmpty) {
@@ -2122,7 +2669,21 @@ class LocalManager with ChangeNotifier {
     final issueList = issues ?? <LocalValidationIssue>[];
 
     if (issues == null) {
-      final comics = targetComics ?? getComics(LocalSortType.timeDesc);
+      final duplicateReport = await _mergeDuplicateDirectories(
+        targetComics: targetComics,
+        onProgress: onProgress,
+      );
+      report.duplicateGroupsFound = duplicateReport.groupsFound;
+      report.duplicateGroupsMerged = duplicateReport.groupsMerged;
+      report.duplicateDirectoriesMerged = duplicateReport.directoriesMerged;
+      report.duplicateFilesMerged = duplicateReport.filesMerged;
+      report.duplicateSamples.addAll(duplicateReport.samples);
+
+      final comics = targetComics == null
+          ? getComics(LocalSortType.timeDesc)
+          : targetComics
+                .map((comic) => find(comic.id, comic.comicType) ?? comic)
+                .toList();
       report.total = comics.length;
       report.dbComics = comics.length;
 
@@ -2143,8 +2704,23 @@ class LocalManager with ChangeNotifier {
         }
       }
 
+      _emitValidationProgress(
+        onProgress,
+        stage: 'validate',
+        message: '${'Validating local comics'.tl} 0/${comics.length}',
+        current: 0,
+        total: comics.length,
+      );
       for (final comic in comics) {
         report.checked++;
+        _emitValidationProgress(
+          onProgress,
+          stage: 'validate',
+          message:
+              '${'Validating local comics'.tl} ${report.checked}/${comics.length}: ${comic.title}',
+          current: report.checked,
+          total: comics.length,
+        );
         final info = _comicInfoItems[_comicInfoKey(comic.comicType, comic.id)];
         final reasons = await _findComicValidationReasons(
           comic,
@@ -2190,19 +2766,58 @@ class LocalManager with ChangeNotifier {
       return report;
     }
 
-    for (final issue in issueList) {
+    _emitValidationProgress(
+      onProgress,
+      stage: 'repair',
+      message: '${'Repairing local comics'.tl} 0/${issueList.length}',
+      current: 0,
+      total: issueList.length,
+    );
+    for (int issueIndex = 0; issueIndex < issueList.length; issueIndex++) {
+      final issue = issueList[issueIndex];
       final comic = issue.comic;
       final info = issue.info;
 
+      _emitValidationProgress(
+        onProgress,
+        stage: 'repair',
+        message:
+            '${'Repairing local comics'.tl} ${issueIndex + 1}/${issueList.length}: ${comic.title}',
+        current: issueIndex,
+        total: issueList.length,
+      );
+
       if (issue.reason.contains('missing comic info entry')) {
-        _upsertComicInfo(comic);
+        await _upsertComicInfoAsync(comic);
         report.repaired++;
+        _emitValidationProgress(
+          onProgress,
+          stage: 'repair',
+          message:
+              '${'Repairing local comics'.tl} ${issueIndex + 1}/${issueList.length}: ${comic.title}',
+          current: issueIndex + 1,
+          total: issueList.length,
+        );
+        if (issueIndex % 5 == 0) {
+          await Future.delayed(const Duration(milliseconds: 1));
+        }
         continue;
       }
 
       if (comic.comicType == ComicType.local) {
-        _upsertComicInfo(comic);
+        await _upsertComicInfoAsync(comic);
         report.repaired++;
+        _emitValidationProgress(
+          onProgress,
+          stage: 'repair',
+          message:
+              '${'Repairing local comics'.tl} ${issueIndex + 1}/${issueList.length}: ${comic.title}',
+          current: issueIndex + 1,
+          total: issueList.length,
+        );
+        if (issueIndex % 5 == 0) {
+          await Future.delayed(const Duration(milliseconds: 1));
+        }
         continue;
       }
 
@@ -2211,6 +2826,14 @@ class LocalManager with ChangeNotifier {
       if (sourceKey == null || comicId == null) {
         report.failed++;
         report.messages.add('Cannot repair (missing source): ${comic.title}');
+        _emitValidationProgress(
+          onProgress,
+          stage: 'repair',
+          message:
+              '${'Repairing local comics'.tl} ${issueIndex + 1}/${issueList.length}: ${comic.title}',
+          current: issueIndex + 1,
+          total: issueList.length,
+        );
         continue;
       }
 
@@ -2219,6 +2842,14 @@ class LocalManager with ChangeNotifier {
         report.failed++;
         report.messages.add(
           'Cannot repair (source unsupported): ${comic.title}',
+        );
+        _emitValidationProgress(
+          onProgress,
+          stage: 'repair',
+          message:
+              '${'Repairing local comics'.tl} ${issueIndex + 1}/${issueList.length}: ${comic.title}',
+          current: issueIndex + 1,
+          total: issueList.length,
         );
         continue;
       }
@@ -2238,6 +2869,20 @@ class LocalManager with ChangeNotifier {
           addTask(task);
 
           while (isDownloading(comic.id, comic.comicType)) {
+            _emitValidationProgress(
+              onProgress,
+              stage: 'repair',
+              message:
+                  '${'Repairing local comics'.tl} ${issueIndex + 1}/${issueList.length}: ${comic.title}',
+              current: issueIndex,
+              total: issueList.length,
+              progress: issueList.isEmpty
+                  ? null
+                  : ((issueIndex + task.progress) / issueList.length).clamp(
+                      0.0,
+                      1.0,
+                    ),
+            );
             await Future.delayed(const Duration(milliseconds: 500));
           }
 
@@ -2272,6 +2917,14 @@ class LocalManager with ChangeNotifier {
           'Repair failed after $maxRetries retries: ${comic.title}',
         );
       }
+      _emitValidationProgress(
+        onProgress,
+        stage: 'repair',
+        message:
+            '${'Repairing local comics'.tl} ${issueIndex + 1}/${issueList.length}: ${comic.title}',
+        current: issueIndex + 1,
+        total: issueList.length,
+      );
     }
 
     await _flushComicInfo();
@@ -2755,9 +3408,14 @@ class LocalValidationReport {
   int repaired = 0;
   int failed = 0;
   int skipped = 0;
+  int duplicateGroupsFound = 0;
+  int duplicateGroupsMerged = 0;
+  int duplicateDirectoriesMerged = 0;
+  int duplicateFilesMerged = 0;
   final List<String> messages = [];
   final List<LocalValidationIssue> issues = [];
   final List<String> unindexedDirectorySamples = [];
+  final List<String> duplicateSamples = [];
 }
 
 class LocalValidationIssue {
@@ -2788,6 +3446,49 @@ class LocalDatabaseRestoreReport {
   int skipped = 0;
   int failed = 0;
   final List<String> messages = [];
+}
+
+class LocalValidationProgress {
+  final String stage;
+  final String message;
+  final int current;
+  final int total;
+  final double? progress;
+
+  const LocalValidationProgress({
+    required this.stage,
+    required this.message,
+    required this.current,
+    required this.total,
+    this.progress,
+  });
+}
+
+typedef LocalValidationProgressCallback =
+    void Function(LocalValidationProgress progress);
+
+class LocalDuplicateMergeReport {
+  int groupsFound = 0;
+  int groupsMerged = 0;
+  int directoriesMerged = 0;
+  int filesMerged = 0;
+  final List<String> samples = [];
+}
+
+class _LocalDuplicateDirectoryGroup {
+  final String label;
+  final String key;
+  final ComicType? comicType;
+  final String? comicId;
+  final List<Directory> directories;
+
+  const _LocalDuplicateDirectoryGroup({
+    required this.label,
+    required this.key,
+    required this.comicType,
+    required this.comicId,
+    required this.directories,
+  });
 }
 
 enum LocalSortType {
