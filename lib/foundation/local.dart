@@ -290,6 +290,9 @@ class LocalManager with ChangeNotifier {
     LocalComic comic,
     Map<String, dynamic> item,
   ) {
+    final actualDownloadedChapters = comic.hasChapters
+        ? _inferDownloadedChaptersFromDirectory(comic)
+        : comic.downloadedChapters;
     return {
       ...item,
       'sourceKey': comic.comicType.sourceKey,
@@ -297,13 +300,41 @@ class LocalManager with ChangeNotifier {
       'title': item['title'] ?? comic.title,
       'subtitle': item['subtitle'] ?? comic.subtitle,
       'directory': comic.directory,
+      'downloadedChapters':
+          item['downloadedChapters'] ?? actualDownloadedChapters,
       'chapterCount':
           item['chapterCount'] ??
-          (comic.hasChapters ? comic.downloadedChapters.length : 0),
+          (comic.hasChapters ? actualDownloadedChapters.length : 0),
       'pageCount': item['pageCount'] ?? _countComicPagesSync(comic),
       'tags': item['tags'] ?? comic.tags,
       'updatedAt': item['updatedAt'] ?? DateTime.now().toIso8601String(),
     };
+  }
+
+  bool _sameStringList(List<String> left, List<String> right) {
+    if (left.length != right.length) {
+      return false;
+    }
+    for (int i = 0; i < left.length; i++) {
+      if (left[i] != right[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void _syncDownloadedChaptersInDatabaseIfNeeded(
+    LocalComic comic,
+    List<String> actualDownloadedChapters,
+  ) {
+    if (!comic.hasChapters ||
+        _sameStringList(comic.downloadedChapters, actualDownloadedChapters)) {
+      return;
+    }
+    _db.execute(
+      'UPDATE comics SET downloadedChapters = ? WHERE id = ? AND comic_type = ?;',
+      [jsonEncode(actualDownloadedChapters), comic.id, comic.comicType.value],
+    );
   }
 
   Future<void> _loadComicInfo() async {
@@ -319,10 +350,22 @@ class LocalManager with ChangeNotifier {
       if (item == null) {
         continue;
       }
-      _comicInfoItems[key] = _normalizeComicInfo(comic, item);
+      final normalized = _normalizeComicInfo(comic, item);
+      _comicInfoItems[key] = normalized;
+      final actualDownloadedChapters =
+          (normalized['downloadedChapters'] as List?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          comic.downloadedChapters;
+      _syncDownloadedChaptersInDatabaseIfNeeded(
+        comic,
+        actualDownloadedChapters,
+      );
       if (!file.existsSync()) {
         _dirtyComicInfoKeys.add(key);
         shouldMigrateLegacy = true;
+      } else if (item['downloadedChapters'] == null) {
+        _dirtyComicInfoKeys.add(key);
       }
     }
 
@@ -655,6 +698,7 @@ class LocalManager with ChangeNotifier {
     cacheDownloadingComicInfo(
       comic,
       dir.path,
+      downloadedChapters: chapterIds,
       chapterCount: expectedChapterCount,
       pageCount: pageCount,
     );
@@ -665,6 +709,10 @@ class LocalManager with ChangeNotifier {
     final key = _comicInfoKey(comic.comicType, comic.id);
     final old = _comicInfoItems[key] ?? <String, dynamic>{};
     final sourceKey = comic.comicType.sourceKey;
+    final actualDownloadedChapters = comic.hasChapters
+        ? _inferDownloadedChaptersFromDirectory(comic)
+        : comic.downloadedChapters;
+    _syncDownloadedChaptersInDatabaseIfNeeded(comic, actualDownloadedChapters);
     _comicInfoItems[key] = {
       ...old,
       'sourceKey': sourceKey,
@@ -672,7 +720,8 @@ class LocalManager with ChangeNotifier {
       'title': comic.title,
       'subtitle': comic.subtitle,
       'directory': comic.directory,
-      'chapterCount': comic.downloadedChapters.length,
+      'downloadedChapters': actualDownloadedChapters,
+      'chapterCount': actualDownloadedChapters.length,
       'pageCount': _countComicPagesSync(comic),
       'tags': comic.tags,
       'url': url ?? old['url'],
@@ -686,6 +735,10 @@ class LocalManager with ChangeNotifier {
     final key = _comicInfoKey(comic.comicType, comic.id);
     final old = _comicInfoItems[key] ?? <String, dynamic>{};
     final sourceKey = comic.comicType.sourceKey;
+    final actualDownloadedChapters = comic.hasChapters
+        ? _inferDownloadedChaptersFromDirectory(comic)
+        : comic.downloadedChapters;
+    _syncDownloadedChaptersInDatabaseIfNeeded(comic, actualDownloadedChapters);
     final pageCount = await _countComicPagesAsync(comic);
     _comicInfoItems[key] = {
       ...old,
@@ -694,7 +747,8 @@ class LocalManager with ChangeNotifier {
       'title': comic.title,
       'subtitle': comic.subtitle,
       'directory': comic.directory,
-      'chapterCount': comic.downloadedChapters.length,
+      'downloadedChapters': actualDownloadedChapters,
+      'chapterCount': actualDownloadedChapters.length,
       'pageCount': pageCount,
       'tags': comic.tags,
       'url': url ?? old['url'],
@@ -713,6 +767,7 @@ class LocalManager with ChangeNotifier {
   void cacheDownloadingComicInfo(
     ComicDetails comic,
     String directoryPath, {
+    required List<String> downloadedChapters,
     required int chapterCount,
     required int pageCount,
   }) {
@@ -726,6 +781,7 @@ class LocalManager with ChangeNotifier {
       'title': comic.title,
       'subtitle': comic.subTitle ?? '',
       'directory': dir.name,
+      'downloadedChapters': downloadedChapters,
       'chapterCount': chapterCount,
       'pageCount': pageCount,
       'tags': _flattenComicTags(comic),
@@ -2006,6 +2062,16 @@ class LocalManager with ChangeNotifier {
 
     final reasons = <String>[];
 
+    List<String>? expectedDownloadedChapters;
+    final rawDownloadedChapters = info['downloadedChapters'];
+    if (rawDownloadedChapters is List) {
+      expectedDownloadedChapters = rawDownloadedChapters
+          .whereType<Object>()
+          .map((e) => e.toString())
+          .where((e) => e.isNotEmpty)
+          .toList();
+    }
+
     if (checkStoredTitle) {
       final storedTitle = info['title']?.toString();
       if (storedTitle != null &&
@@ -2028,6 +2094,25 @@ class LocalManager with ChangeNotifier {
     final expectedPageCount = (info['pageCount'] as num?)?.toInt();
     final localPages = await _countComicPagesAsync(comic);
     final localChapters = await _countComicChaptersAsync(comic);
+    final actualDownloadedChapters = _inferDownloadedChaptersFromDirectory(
+      comic,
+    );
+
+    if (comic.hasChapters &&
+        expectedDownloadedChapters != null &&
+        expectedDownloadedChapters
+            .toSet()
+            .difference(actualDownloadedChapters.toSet())
+            .isNotEmpty) {
+      reasons.add('downloaded chapters mismatch');
+    } else if (comic.hasChapters &&
+        expectedDownloadedChapters != null &&
+        actualDownloadedChapters
+            .toSet()
+            .difference(expectedDownloadedChapters.toSet())
+            .isNotEmpty) {
+      reasons.add('downloaded chapters mismatch');
+    }
 
     if (expectedChapterCount != null && expectedChapterCount != localChapters) {
       reasons.add('chapter count mismatch');
