@@ -488,23 +488,25 @@ class LocalManager with ChangeNotifier {
     return count;
   }
 
-  List<Directory> _chapterDirectoriesSync(LocalComic comic) {
+  Directory? _chapterDirectoryForComic(LocalComic comic, String chapterId) {
     final base = Directory(comic.baseDir);
     if (!base.existsSync()) {
-      return const [];
+      return null;
     }
-    final dirs = <Directory>[];
-    try {
-      for (final entity in base.listSync(followLinks: false)) {
-        if (entity is Directory && !entity.name.startsWith('.')) {
-          dirs.add(entity);
-        }
-      }
-    } catch (_) {
-      return const [];
+    final chapterTitle = comic.chapters?.allChapters[chapterId] ?? chapterId;
+    final titleDir = Directory(
+      FilePath.join(comic.baseDir, getChapterDirectoryName(chapterTitle)),
+    );
+    if (titleDir.existsSync()) {
+      return titleDir;
     }
-    dirs.sort((a, b) => a.name.compareTo(b.name));
-    return dirs;
+    final idDir = Directory(
+      FilePath.join(comic.baseDir, getChapterDirectoryName(chapterId)),
+    );
+    if (idDir.existsSync()) {
+      return idDir;
+    }
+    return null;
   }
 
   Future<List<Directory>> _chapterDirectoriesAsync(LocalComic comic) async {
@@ -528,8 +530,13 @@ class LocalManager with ChangeNotifier {
 
   int _countComicPagesSync(LocalComic comic) {
     if (comic.hasChapters) {
+      final chapterIds = _inferDownloadedChaptersFromDirectory(comic);
       int count = 0;
-      for (final chapterDir in _chapterDirectoriesSync(comic)) {
+      for (final chapterId in chapterIds) {
+        final chapterDir = _chapterDirectoryForComic(comic, chapterId);
+        if (chapterDir == null) {
+          continue;
+        }
         count += _countImageFilesInDirectorySync(chapterDir);
       }
       return count;
@@ -539,8 +546,13 @@ class LocalManager with ChangeNotifier {
 
   Future<int> _countComicPagesAsync(LocalComic comic) async {
     if (comic.hasChapters) {
+      final chapterIds = _inferDownloadedChaptersFromDirectory(comic);
       int count = 0;
-      for (final chapterDir in await _chapterDirectoriesAsync(comic)) {
+      for (final chapterId in chapterIds) {
+        final chapterDir = _chapterDirectoryForComic(comic, chapterId);
+        if (chapterDir == null) {
+          continue;
+        }
         count += await _countImageFilesInDirectoryAsync(chapterDir);
       }
       return count;
@@ -552,7 +564,7 @@ class LocalManager with ChangeNotifier {
     if (!comic.hasChapters) {
       return 0;
     }
-    return (await _chapterDirectoriesAsync(comic)).length;
+    return _inferDownloadedChaptersFromDirectory(comic).length;
   }
 
   Future<List<Directory>> _chapterDirectoriesByBaseDir(String baseDir) async {
